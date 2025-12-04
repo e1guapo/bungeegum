@@ -10,6 +10,7 @@ op.wait();
 
 var path;
 var data_dir;
+var temp_file_path = null;
 // Check if we are remote mode
 if ('path' in payload_args)
 {
@@ -22,7 +23,9 @@ else
             const context = Java.use('android.app.ActivityThread').currentApplication().getApplicationContext();
             data_dir = context.getDataDir();
         });
-    var local_file = data_dir + "/tmpFile";
+    var unique_suffix = Process.getCurrentThreadId() + "_" + Date.now();
+    var local_file = data_dir + "/tmpFile-" + unique_suffix;
+    temp_file_path = local_file;
     // Copy our ELF to this directory
     console.log('Writing payload:' + local_file);
     var file = new File(local_file,"w");
@@ -45,6 +48,10 @@ var waitpid_ptr = Module.findExportByName('libc.so', 'waitpid');
 var _exit_ptr = Module.findExportByName('libc.so', '_exit');
 var errno_ptr = Module.findExportByName('libc.so', '__errno');
 var strerror_ptr = Module.findExportByName('libc.so', 'strerror');
+var pipe_ptr = Module.findExportByName('libc.so', 'pipe');
+var dup2_ptr = Module.findExportByName('libc.so', 'dup2');
+var close_ptr = Module.findExportByName('libc.so', 'close');
+var read_ptr = Module.findExportByName('libc.so', 'read');
 
 // Allocate argv array
 // Calculate size based on size of payload args
@@ -69,6 +76,14 @@ for (var i = 1; i < payload_args['args'].length + 1; i++)
     args_ptr.add(Process.pointerSize * i).writePointer(tmp_args_arr[i]);
 }
 
+const stdoutCallback = new NativeCallback(function (buf, size) {
+    if (!size || size <= 0) {
+        return;
+    }
+    var chunk = Memory.readByteArray(buf, size);
+    send({type: 'stdout'}, chunk);
+}, 'void', ['pointer', 'int']);
+
 // symbol list to be passed into CModule
 const symbols = {
     fork: fork_ptr,
@@ -79,10 +94,16 @@ const symbols = {
     __errno: errno_ptr,
     strerror: strerror_ptr,
     args: args_ptr,
+    pipe: pipe_ptr,
+    dup2: dup2_ptr,
+    close: close_ptr,
+    read: read_ptr,
+    report_stdout: stdoutCallback,
 };
 
 const ccode=`
 #include <stdio.h>
+#include <stddef.h>
 
 // Prototypes of functions we're passing in
 extern int fork(void);
@@ -93,24 +114,48 @@ extern int log(int prio, const char *tag, const char *fmt, ...);
 extern char *args[${argc}];
 extern int *__errno();
 extern char *strerror(int errnum);
+extern int pipe(int pipefd[2]);
+extern int dup2(int oldfd, int newfd);
+extern int close(int fd);
+extern ssize_t read(int fd, void *buf, size_t count);
+extern void report_stdout(char *buf, int len);
 
 #define errno (*__errno())
 
 #define        WEXITSTATUS(status)     (((status) & 0xff00) >> 8)
 #define        WTERMSIG(status)        ((status) & 0x7f)
 #define        WIFEXITED(status)       (WTERMSIG(status) == 0)
+#ifndef EINTR
+#define EINTR 4
+#endif
 #define DBG 3
 #define ERR 6
+#define STDOUT_BUF_SIZE 1024
 
 int main(char *path) {
     const char *TAG = "Bungeegum_elf";
     int pid = -1;
     int status = 1;
     int argc = ${argc};
+    int pipefd[2] = {-1, -1};
+
+    if (pipe(pipefd) != 0)
+    {
+        log(ERR, TAG, "pipe() failed. errno: %d, %s", errno, strerror(errno));
+        return status;
+    }
 
     pid = fork();
     if (pid == 0)
     {
+        // Spawned process: redirect stdout/stderr to the pipe.
+        close(pipefd[0]);
+        if (dup2(pipefd[1], 1) == -1 || dup2(pipefd[1], 2) == -1)
+        {
+            log(ERR, TAG, "dup2() failed. errno: %d, %s", errno, strerror(errno));
+        }
+        close(pipefd[1]);
+
         for (int i = 0; i <= argc + 1; i++)
         {
             log(DBG, TAG, "%p arg[%d]: %s", &args[i], i, args[i]);
@@ -125,6 +170,31 @@ int main(char *path) {
     if (pid > 0)
     {
         log(DBG, TAG, "Elf payload pid is %d", pid);
+
+        // Parent process: send child's stdout/stderr back to the CLI.
+        close(pipefd[1]);
+        char buffer[STDOUT_BUF_SIZE];
+        while (1)
+        {
+            ssize_t count = read(pipefd[0], buffer, sizeof(buffer));
+            if (count > 0)
+            {
+                report_stdout(buffer, (int)count);
+                continue;
+            }
+            if (count == 0)
+            {
+                break;
+            }
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            log(ERR, TAG, "read() failed. errno: %d, %s", errno, strerror(errno));
+            break;
+        }
+        close(pipefd[0]);
+
         if (!waitpid(pid, &status, 0))
         {
             log(ERR, TAG, "waitpid() failed. errno: %d, %s", errno, strerror(errno));
@@ -141,6 +211,8 @@ int main(char *path) {
     if (pid < 0)
     {
         log(ERR, TAG, "fork() returned: %d. errno: %d, %s", pid, errno, strerror(errno));
+        close(pipefd[0]);
+        close(pipefd[1]);
         return status;
     }
 }
@@ -151,3 +223,12 @@ const nativeFunc= new NativeFunction(cm.main, 'int', ['pointer']);
 var path_ptr = Memory.allocUtf8String(path);
 var result = nativeFunc(ptr(path_ptr));
 send(result);
+
+// Delete the payload file.
+if (temp_file_path !== null) {
+    Java.perform(function() {
+        const File = Java.use('java.io.File');
+        var tmp = File.$new.overload('java.lang.String').call(File, temp_file_path);
+        tmp.delete();
+    });
+}

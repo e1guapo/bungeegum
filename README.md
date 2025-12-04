@@ -65,6 +65,9 @@ server (for example, `adb` forwarded over SSH), set the standard
 `ADB_SERVER_SOCKET` environment variable before launching the tool, e.g.
 `export ADB_SERVER_SOCKET=tcp:127.0.0.1:5038`.
 
+When an ELF is executed, its `stdout`/`stderr` streams are mirrored back to the
+`bungeegum` CLI.
+
 ## Examples
 
 - Run an ELF from the host on the device:

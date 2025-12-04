@@ -15,6 +15,10 @@ var waitpid_ptr = Module.findExportByName('libc.so', 'waitpid');
 var errno_ptr = Module.findExportByName('libc.so', '__errno');
 var strerror_ptr = Module.findExportByName('libc.so', 'strerror');
 var _exit_ptr = Module.findExportByName('libc.so', '_exit');
+var pipe_ptr = Module.findExportByName('libc.so', 'pipe');
+var dup2_ptr = Module.findExportByName('libc.so', 'dup2');
+var close_ptr = Module.findExportByName('libc.so', 'close');
+var read_ptr = Module.findExportByName('libc.so', 'read');
 
 var shellcode_ptr;
 var shellcode_main_ptr;
@@ -27,6 +31,14 @@ shellcode_ptr.writeByteArray(shellcode_bytes);
 Memory.protect(shellcode_ptr, shellcode_bytes.length, 'rwx')
 shellcode_main_ptr = new NativeFunction(shellcode_ptr, 'int', []);
 
+const stdoutCallback = new NativeCallback(function (buf, size) {
+    if (!size || size <= 0) {
+        return;
+    }
+    var chunk = Memory.readByteArray(buf, size);
+    send({type: 'stdout'}, chunk);
+}, 'void', ['pointer', 'int']);
+
 // symbol list to be passed into CModule
 const symbols = {
     fork: fork_ptr,
@@ -34,12 +46,18 @@ const symbols = {
     waitpid: waitpid_ptr,
     __errno: errno_ptr,
     strerror: strerror_ptr,
+    pipe: pipe_ptr,
+    dup2: dup2_ptr,
+    close: close_ptr,
+    read: read_ptr,
+    report_stdout: stdoutCallback,
     _exit: _exit_ptr,
     shellcode_main: shellcode_main_ptr
 };
 
 const ccode=`
 #include <stdio.h>
+#include <stddef.h>
 
 // Prototypes of functions we're passing in
 extern int fork(void);
@@ -49,30 +67,80 @@ extern int shellcode_main();
 extern int log(int prio, const char *tag, const char *fmt, ...);
 extern int *__errno();
 extern char *strerror(int errnum);
+extern int pipe(int pipefd[2]);
+extern int dup2(int oldfd, int newfd);
+extern int close(int fd);
+extern ssize_t read(int fd, void *buf, size_t count);
+extern void report_stdout(char *buf, int len);
 
 #define errno (*__errno())
 
 #define        WEXITSTATUS(status)     (((status) & 0xff00) >> 8)
 #define        WTERMSIG(status)        ((status) & 0x7f)
 #define        WIFEXITED(status)       (WTERMSIG(status) == 0)
+#ifndef EINTR
+#define EINTR 4
+#endif
 #define DBG 3
 #define ERR 6
+#define STDOUT_BUF_SIZE 1024
 
 int main(char *path) {
     const char *TAG = "Bungeegum_sc";
     int pid = -1;
     int status = -1;
+    int pipefd[2] = {-1, -1};
+
+    if (pipe(pipefd) != 0)
+    {
+        log(ERR, TAG, "pipe() failed. errno: %d, %s", errno, strerror(errno));
+        return status;
+    }
 
     pid = fork();
     if (pid == 0)
     {
+        // Spawned process: redirect stdout/stderr to the pipe.
+        close(pipefd[0]);
+        if (dup2(pipefd[1], 1) == -1 || dup2(pipefd[1], 2) == -1)
+        {
+            log(ERR, TAG, "dup2() failed. errno: %d, %s", errno, strerror(errno));
+        }
+        close(pipefd[1]);
+
         status = shellcode_main();
         log(DBG, TAG, "shellcode returned: %d", status);
+        fflush(NULL); // Flush stdio buffers to ensure output is written before _exit
         _exit(status);
     }
     if (pid > 0)
     {
         log(DBG, TAG, "Shellcode payload pid is %d", pid);
+
+        // Parent process: send child's stdout/stderr back to the CLI.
+        close(pipefd[1]);
+        char buffer[STDOUT_BUF_SIZE];
+        while (1)
+        {
+            ssize_t count = read(pipefd[0], buffer, sizeof(buffer));
+            if (count > 0)
+            {
+                report_stdout(buffer, (int)count);
+                continue;
+            }
+            if (count == 0)
+            {
+                break;
+            }
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            log(ERR, TAG, "read() failed. errno: %d, %s", errno, strerror(errno));
+            break;
+        }
+        close(pipefd[0]);
+
         if (!waitpid(pid, &status, 0))
         {
             log(ERR, TAG, "waitpid() failed. errno: %d, %s", errno, strerror(errno));
@@ -89,6 +157,8 @@ int main(char *path) {
     if (pid < 0)
     {
         log(ERR, TAG, "fork() returned: %d. errno: %d, %s", pid, errno, strerror(errno));
+        close(pipefd[0]);
+        close(pipefd[1]);
         return status;
     }
 }
