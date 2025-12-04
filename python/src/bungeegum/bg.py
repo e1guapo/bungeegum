@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import os
 import sys
 import time
 import typing
@@ -22,6 +23,53 @@ BG_PY_PKG = "bungeegum"
 MAIN_ACTIVITY = BG_PKG + "/.BgActivity"
 LOCALHOST = "127.0.0.1"
 DEFAULT_ADB_SERVER_PORT = 5037
+
+
+def get_adb_server() -> typing.Tuple[str, int]:
+    """
+    Determine which ADB server host/port to use.
+
+    Honors the standard ADB_SERVER_SOCKET environment variable when present,
+    otherwise defaulting to LOCALHOST/DEFAULT_ADB_SERVER_PORT.
+    """
+    host = LOCALHOST
+    port = DEFAULT_ADB_SERVER_PORT
+    server_socket = os.environ.get("ADB_SERVER_SOCKET")
+
+    if not server_socket:
+        return host, port
+
+    value = server_socket.strip()
+
+    if value.startswith("tcp:"):
+        value = value[4:]
+    else:
+        logging.warning(
+            "Unsupported ADB_SERVER_SOCKET value %r, falling back to %s:%s",
+            server_socket,
+            host,
+            port,
+        )
+        return host, port
+
+    try:
+        # Accept host:port.
+        host_candidate, port_candidate = value.rsplit(":", 1)
+
+        # Try to convert the port first to ensure we either set BOTH the host
+        # and port or neither.
+        port = int(port_candidate)
+        if host_candidate:
+            host = host_candidate
+    except ValueError:
+        logging.warning(
+            "Unsupported ADB_SERVER_SOCKET value %r, falling back to %s:%s",
+            server_socket,
+            host,
+            port,
+        )
+
+    return host, port
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,7 +122,8 @@ def get_device(device_id: typing.Optional[str]) -> adbutils.AdbDevice:
     Returns:
         device: ADB device object
     """
-    client = adbutils.AdbClient(host=LOCALHOST, port=DEFAULT_ADB_SERVER_PORT)
+    host, port = get_adb_server()
+    client = adbutils.AdbClient(host=host, port=port)
     device_list = client.device_list()
     if not device_list:
         raise adbutils.errors.AdbError("no connected devices found")
