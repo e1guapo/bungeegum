@@ -18,11 +18,8 @@ if ('path' in payload_args)
 }
 else
 {
-    // Use Android API to find our apps data dir
-    Java.perform(function() {
-            const context = Java.use('android.app.ActivityThread').currentApplication().getApplicationContext();
-            data_dir = context.getDataDir();
-        });
+    // Use the app's data directory directly (avoid early Java dependency)
+    data_dir = '/data/data/com.zetier.bungeegum';
     var unique_suffix = Process.getCurrentThreadId() + "_" + Date.now();
     var local_file = data_dir + "/tmpFile-" + unique_suffix;
     temp_file_path = local_file;
@@ -34,11 +31,14 @@ else
     }
     var file = new File(local_file, "wb");
     file.write(payload_bytes);
-    Java.perform(function() {
-            const File = Java.use('java.io.File');
-            var localFile = File.$new.overload('java.lang.String').call(File, local_file);
-            localFile.setExecutable(true, false);
-        });
+    // Mark executable via libc chmod to avoid Java timing issues
+    const chmod_ptr = Module.findExportByName('libc.so', 'chmod');
+    const chmod = new NativeFunction(chmod_ptr, 'int', ['pointer', 'int']);
+    var chmod_path = Memory.allocUtf8String(local_file);
+    var chmod_ret = chmod(chmod_path, 0o755);
+    if (chmod_ret !== 0) {
+        throw new Error('chmod failed with code ' + chmod_ret);
+    }
     file.close();
     // Set the path to be exec'd to our new local file
     path = local_file;
@@ -100,7 +100,6 @@ const symbols = {
     waitpid: waitpid_ptr,
     __errno: errno_ptr,
     strerror: strerror_ptr,
-    args: args_ptr,
     pipe: pipe_ptr,
     dup2: dup2_ptr,
     close: close_ptr,
@@ -119,7 +118,6 @@ extern int waitpid(int pid, int *wstatus, int opts);
 extern void _exit(int status);
 extern int execv(const char *pathname, char *const argv[]);
 extern int log(int prio, const char *tag, const char *fmt, ...);
-extern char **args;
 extern int *__errno();
 extern char *strerror(int errnum);
 extern int pipe(int pipefd[2]);
@@ -165,7 +163,7 @@ struct pollfd
     short revents;
 };
 
-int main(char *path) {
+int main(char *path, char **argv) {
     const char *TAG = "Bungeegum_elf";
     int pid = -1;
     int status = 1;
@@ -189,13 +187,7 @@ int main(char *path) {
         }
         close(pipefd[1]);
 
-        for (int i = 0; i <= argc + 1; i++)
-        {
-            log(DBG, TAG, "%p arg[%d]: %s", &args[i], i, args[i]);
-        }
-
-        log(DBG, TAG, "execve(%s, %p)", path, args);
-        int exec_ret = execv(path, args);
+        int exec_ret = execv(path, argv);
         log(ERR, TAG, "execv() returned: %d. errno: %i, %s", exec_ret, errno, strerror(errno));
         _exit(exec_ret);
 
@@ -329,16 +321,14 @@ int main(char *path) {
 `;
 
 const cm = new CModule(ccode, symbols, {toolchain: 'any'});
-const nativeFunc= new NativeFunction(cm.main, 'int', ['pointer']);
+const nativeFunc= new NativeFunction(cm.main, 'int', ['pointer', 'pointer']);
 var path_ptr = Memory.allocUtf8String(path);
-var result = nativeFunc(ptr(path_ptr));
+var result = nativeFunc(ptr(path_ptr), ptr(args_ptr));
 send(result);
 
 // Delete the payload file.
 if (temp_file_path !== null) {
-    Java.perform(function() {
-        const File = Java.use('java.io.File');
-        var tmp = File.$new.overload('java.lang.String').call(File, temp_file_path);
-        tmp.delete();
-    });
+    const unlink_ptr = Module.findExportByName('libc.so', 'unlink');
+    const unlink = new NativeFunction(unlink_ptr, 'int', ['pointer']);
+    unlink(Memory.allocUtf8String(temp_file_path));
 }
