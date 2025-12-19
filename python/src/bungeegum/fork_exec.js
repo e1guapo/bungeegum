@@ -28,8 +28,12 @@ else
     temp_file_path = local_file;
     // Copy our ELF to this directory
     console.log('Writing payload:' + local_file);
-    var file = new File(local_file,"w");
-    file.write(payload_args['data']);
+    var payload_bytes = payload_args['data'];
+    if (!(payload_bytes instanceof Uint8Array)) {
+        payload_bytes = Uint8Array.from(payload_bytes);
+    }
+    var file = new File(local_file, "wb");
+    file.write(payload_bytes);
     Java.perform(function() {
             const File = Java.use('java.io.File');
             var localFile = File.$new.overload('java.lang.String').call(File, local_file);
@@ -76,6 +80,8 @@ for (var i = 1; i < payload_args['args'].length + 1; i++)
     console.log(args_ptr.add(Process.pointerSize * i) + " arg[" + i + "]: " + payload_args['args'][i-1]);
     args_ptr.add(Process.pointerSize * i).writePointer(tmp_args_arr[i]);
 }
+// Null-terminate argv
+args_ptr.add(Process.pointerSize * (argc + 1)).writePointer(ptr(0));
 
 const stdoutCallback = new NativeCallback(function (buf, size) {
     if (!size || size <= 0) {
@@ -113,7 +119,7 @@ extern int waitpid(int pid, int *wstatus, int opts);
 extern void _exit(int status);
 extern int execv(const char *pathname, char *const argv[]);
 extern int log(int prio, const char *tag, const char *fmt, ...);
-extern char *args[${argc}];
+extern char **args;
 extern int *__errno();
 extern char *strerror(int errnum);
 extern int pipe(int pipefd[2]);
