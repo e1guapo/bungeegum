@@ -25,49 +25,63 @@ LOCALHOST = "127.0.0.1"
 DEFAULT_ADB_SERVER_PORT = 5037
 
 
+def fallback_default_adb_server(adb_server_socket: str):
+    """
+    Issue warning and fall back to default ADB Server settings.
+
+    Also sets ADB_SERVER_SOCKET so Frida can use it.
+    """
+    logging.warning(
+        "Unsupported ADB_SERVER_SOCKET value %r, falling back to %s:%s",
+        adb_server_socket,
+        LOCALHOST,
+        DEFAULT_ADB_SERVER_PORT,
+    )
+
+    # Set the environment variable so Frida can also use it.
+    os.environ["ADB_SERVER_SOCKET"] = f"tcp:{LOCALHOST}:{DEFAULT_ADB_SERVER_PORT}"
+
+    return LOCALHOST, DEFAULT_ADB_SERVER_PORT
+
+
 def get_adb_server() -> typing.Tuple[str, int]:
     """
     Determine which ADB server host/port to use.
 
     Honors the standard ADB_SERVER_SOCKET environment variable when present,
     otherwise defaulting to LOCALHOST/DEFAULT_ADB_SERVER_PORT.
+
+    Also normalizes ADB_SERVER_SOCKET to the full format so Frida can use it.
     """
     host = LOCALHOST
     port = DEFAULT_ADB_SERVER_PORT
     server_socket = os.environ.get("ADB_SERVER_SOCKET")
 
-    if not server_socket:
-        return host, port
+    if server_socket:
+        value = server_socket.strip()
 
-    value = server_socket.strip()
+        if value.startswith("tcp:"):
+            value = value[4:]
+        else:
+            return fallback_default_adb_server(server_socket)
 
-    if value.startswith("tcp:"):
-        value = value[4:]
-    else:
-        logging.warning(
-            "Unsupported ADB_SERVER_SOCKET value %r, falling back to %s:%s",
-            server_socket,
-            host,
-            port,
-        )
-        return host, port
+        try:
+            # Accept host:port or just port.
+            if ":" in value:
+                host_candidate, port_candidate = value.rsplit(":", 1)
+            else:
+                host_candidate, port_candidate = "", value
 
-    try:
-        # Accept host:port.
-        host_candidate, port_candidate = value.rsplit(":", 1)
+            # Try to convert the port first to ensure we either set BOTH the host
+            # and port or neither.
+            port = int(port_candidate.strip())
+            if host_candidate:
+                host = host_candidate.strip()
+        except ValueError:
+            return fallback_default_adb_server(server_socket)
 
-        # Try to convert the port first to ensure we either set BOTH the host
-        # and port or neither.
-        port = int(port_candidate)
-        if host_candidate:
-            host = host_candidate
-    except ValueError:
-        logging.warning(
-            "Unsupported ADB_SERVER_SOCKET value %r, falling back to %s:%s",
-            server_socket,
-            host,
-            port,
-        )
+        # Normalize the environment variable so Frida can also use it.
+        os.environ["ADB_SERVER_SOCKET"] = f"tcp:{host}:{port}"
 
     return host, port
 
