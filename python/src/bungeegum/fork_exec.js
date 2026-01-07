@@ -180,6 +180,8 @@ int main(char *path) {
         if (dup2(pipefd[1], 1) == -1 || dup2(pipefd[1], 2) == -1)
         {
             log(ERR, TAG, "dup2() failed. errno: %d, %s", errno, strerror(errno));
+            close(pipefd[1]);
+            _exit(1);
         }
         close(pipefd[1]);
 
